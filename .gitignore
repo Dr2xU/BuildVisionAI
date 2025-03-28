@@ -34,9 +34,12 @@ env/
 .DS_Store
 
 # Application specific
-legend_symbols/*
+legend_symbols/
 !legend_symbols/.gitkeep
 symbol_links/
+symbol_icons/
+blueprint_images/
+converted_images/
 output/
 tmp/
 *.log
