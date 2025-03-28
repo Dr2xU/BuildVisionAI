@@ -35,6 +35,7 @@ env/
 
 # Application specific
 legend_symbols/*
+!legend_symbols/.gitkeep
 symbol_links/
 output/
 tmp/

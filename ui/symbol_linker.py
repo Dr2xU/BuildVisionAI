@@ -1,172 +1,271 @@
 import tkinter as tk
+from tkinter import Toplevel
 from PIL import Image, ImageTk
 import cv2
 import numpy as np
 import pytesseract
 import json
 import os
-from utils.image_tools import detect_symbols
+import logging
+from utils.image_tools import detect_symbols, detect_text
+from utils.state_manager import state
+
 
 class SymbolLinker:
-    def __init__(self, root, image_path, legend_bbox_path, on_done=None):
+    def __init__(self, root, image_path=None, on_done=None):
         self.root = root
-        self.root.title("Link Symbols to Labels")
-        self.root.attributes("-fullscreen", True)
+        toplevel = self.root.winfo_toplevel()
+        toplevel.title("Link Symbols to Labels")
+        toplevel.attributes("-fullscreen", True)
+
         self.on_done = on_done
 
-        # Load original image and bbox
-        self.original_image = cv2.imread(image_path)
-        self.original_image = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2RGB)
-        with open(legend_bbox_path, "r") as f:
-            bbox = json.load(f)
-        self.bbox = bbox
-        self.x1, self.y1, self.x2, self.y2 = bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"]
+        legend_path = state.legend_path or image_path
+        if not legend_path or not os.path.exists(legend_path):
+            raise FileNotFoundError(f"Legend image not found at {legend_path}")
 
-        # Crop and prepare display image
-        self.legend_crop = self.original_image[self.y1:self.y2, self.x1:self.x2]
+        self.legend_crop = cv2.imread(legend_path)
+        self.legend_crop = cv2.cvtColor(self.legend_crop, cv2.COLOR_BGR2RGB)
         self.zoom_factor = 1.0
 
-        self.canvas = tk.Canvas(root, bg="black", highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.main_frame = tk.Frame(self.root)
+        self.main_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.canvas = tk.Canvas(self.main_frame, bg="white", highlightthickness=0)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.side_panel = tk.Frame(self.main_frame, width=500, bg="black")
+        self.side_panel.pack(side=tk.RIGHT, fill=tk.Y)
+
         self.tk_image = None
         self.image_on_canvas = None
 
-        self.symbols = []
-        self.text_links = []
+        self.image_x_offset = 0
+        self.image_y_offset = 0
+        self.image_scale = 1.0
+
+        self.links = []
+        self.visual_elements = []  # List of drawn canvas items per link
         self.current_symbol = None
         self.selection_box = None
         self.start_x = self.start_y = 0
-        self.selecting_text = False
+        self.selecting = False
+        self.detection_mode = "symbol"
 
         self.setup_controls()
         self.bind_keys()
-        self.render_image()
+        self.root.after(50, self.render_image)
+        self.root.bind("<Escape>", self.exit_application)
+
+        logging.info(f"Legend loaded from: {legend_path}")
 
     def setup_controls(self):
-        self.control_frame = tk.Frame(self.root, bg="black")
-        self.control_frame.place(relx=0.01, rely=0.01)
-        tk.Button(self.control_frame, text="🧽 Clear Last", command=self.clear_last).pack(pady=2)
-        tk.Button(self.control_frame, text="❌ Clear All", command=self.clear_all).pack(pady=2)
-        tk.Button(self.control_frame, text="↩ Save & Exit", command=self.save_and_continue).pack(pady=2)
+        ctrl = tk.Frame(self.side_panel, bg="gray20")
+        ctrl.pack(fill=tk.X, pady=10)
+
+        tk.Button(ctrl, text="🧽 Clear Last", command=self.clear_last).pack(pady=2, fill=tk.X)
+        tk.Button(ctrl, text="❌ Clear All", command=self.clear_all).pack(pady=2, fill=tk.X)
+        tk.Button(ctrl, text="↩ Save & Exit", command=self.save_and_continue).pack(pady=2, fill=tk.X)
+        self.link_table = tk.Listbox(self.side_panel, bg="white", fg="black")
+        self.link_table.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
     def bind_keys(self):
-        self.canvas.bind("+", self.zoom_in)
-        self.canvas.bind("-", self.zoom_out)
-        self.canvas.bind("<Up>", lambda e: self.canvas.yview_scroll(-1, "units"))
-        self.canvas.bind("<Down>", lambda e: self.canvas.yview_scroll(1, "units"))
-        self.canvas.bind("<Left>", lambda e: self.canvas.xview_scroll(-1, "units"))
-        self.canvas.bind("<Right>", lambda e: self.canvas.xview_scroll(1, "units"))
-        self.canvas.bind("<Button-1>", self.on_click)
-        self.canvas.bind("<ButtonPress-3>", self.start_text_area)
-        self.canvas.bind("<B3-Motion>", self.drag_text_area)
-        self.canvas.bind("<ButtonRelease-3>", self.ocr_text_area)
+        self.canvas.bind("i", self.zoom_in)
+        self.canvas.bind("o", self.zoom_out)
+        self.canvas.bind("<ButtonPress-1>", self.on_mouse_down)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
+
+    def exit_application(self, event=None):
+        logging.info("Exiting application")
+        self.root.quit()
 
     def render_image(self):
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
+        canvas_width = self.root.winfo_width() - 500
+        canvas_height = self.root.winfo_height()
+        h, w = self.legend_crop.shape[:2]
+        aspect = w / h
 
-        aspect = self.legend_crop.shape[1] / self.legend_crop.shape[0]
-        fit_w = screen_w
-        fit_h = int(fit_w / aspect)
-        if fit_h > screen_h:
-            fit_h = screen_h
-            fit_w = int(fit_h * aspect)
+        if canvas_width / aspect > canvas_height:
+            fit_w = int(canvas_height * aspect)
+            fit_h = canvas_height
+        else:
+            fit_w = canvas_width
+            fit_h = int(canvas_width / aspect)
 
         resized = cv2.resize(self.legend_crop, (fit_w, fit_h), interpolation=cv2.INTER_AREA)
         self.display_crop = resized.copy()
-        self.display_scale = fit_w / (self.x2 - self.x1)
+        self.image_scale = self.legend_crop.shape[1] / fit_w
+        self.image_x_offset = (canvas_width - fit_w) // 2 + 250
+        self.image_y_offset = (canvas_height - fit_h) // 2
 
-        for sym in self.symbols:
-            sx, sy, sw, sh = sym["rel_x"], sym["rel_y"], sym["w"], sym["h"]
-            cv2.rectangle(self.display_crop, (sx, sy), (sx + sw, sy + sh), (0, 255, 255), 2)
-        for link in self.text_links:
-            lx, ly, lw, lh = link["rel_x"], link["rel_y"], link["w"], link["h"]
-            cv2.rectangle(self.display_crop, (lx, ly), (lx + lw, ly + lh), (0, 255, 0), 2)
-            cv2.putText(self.display_crop, link["text"], (lx, ly - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-        pil_img = Image.fromarray(self.display_crop)
-        self.tk_image = ImageTk.PhotoImage(pil_img)
         self.canvas.delete("all")
-        canvas_w = self.canvas.winfo_width()
-        canvas_h = self.canvas.winfo_height()
-        offset_x = (canvas_w - fit_w) // 2
-        offset_y = (canvas_h - fit_h) // 2
-        self.image_on_canvas = self.canvas.create_image(offset_x, offset_y, anchor=tk.NW, image=self.tk_image)
+        self.tk_image = ImageTk.PhotoImage(Image.fromarray(self.display_crop))
+        self.image_on_canvas = self.canvas.create_image(
+            self.image_x_offset, self.image_y_offset, anchor=tk.NW, image=self.tk_image
+        )
+        self.canvas.config(scrollregion=self.canvas.bbox("all"))
+        self.redraw_links()
 
-    def on_click(self, event):
-        x = int(event.x / self.display_scale)
-        y = int(event.y / self.display_scale)
-        box_size = int(50 / self.display_scale)
-        cropped = self.legend_crop[max(0, y - box_size): y + box_size, max(0, x - box_size): x + box_size]
-        _, candidates = detect_symbols(cropped)
-        if candidates:
-            c = candidates[0]
-            abs_x = max(0, x - box_size) + c["X"]
-            abs_y = max(0, y - box_size) + c["Y"]
-            sym = {
-                "rel_x": int(abs_x * self.display_scale),
-                "rel_y": int(abs_y * self.display_scale),
-                "x": abs_x + self.x1,
-                "y": abs_y + self.y1,
-                "w": int(c["Width"] * self.display_scale),
-                "h": int(c["Height"] * self.display_scale),
-            }
-            self.symbols.append(sym)
-            self.current_symbol = sym
-            self.render_image()
+    def redraw_links(self):
+        for idx, link in enumerate(self.links):
+            self.draw_link(link)
 
-    def start_text_area(self, event):
+    def draw_link(self, link):
+        sx, sy, sw, sh = link["symbol"]['rel_x'], link["symbol"]['rel_y'], link["symbol"]['w'], link["symbol"]['h']
+        tx, ty, tw, th = link["text"]['rel_x'], link["text"]['rel_y'], link["text"]['w'], link["text"]['h']
+
+        sx1 = sx / self.image_scale + self.image_x_offset
+        sy1 = sy / self.image_scale + self.image_y_offset
+        sx2 = (sx + sw) / self.image_scale + self.image_x_offset
+        sy2 = (sy + sh) / self.image_scale + self.image_y_offset
+
+        tx1 = tx / self.image_scale + self.image_x_offset
+        ty1 = ty / self.image_scale + self.image_y_offset
+        tx2 = (tx + tw) / self.image_scale + self.image_x_offset
+        ty2 = (ty + th) / self.image_scale + self.image_y_offset
+
+        rect1 = self.canvas.create_rectangle(sx1, sy1, sx2, sy2, outline="lime", width=2)
+        rect2 = self.canvas.create_rectangle(tx1, ty1, tx2, ty2, outline="lime", width=2)
+
+        line = self.canvas.create_line((sx + sw) / self.image_scale + self.image_x_offset,
+                                (sy + sh // 2) / self.image_scale + self.image_y_offset,
+                                (tx) / self.image_scale + self.image_x_offset,
+                                (ty + th // 2) / self.image_scale + self.image_y_offset,
+                                fill="red", width=2)
+        
+        self.visual_elements.append([rect1, rect2, line])
+
+    def on_mouse_down(self, event):
         self.start_x = event.x
         self.start_y = event.y
-        self.selecting_text = True
+        self.selecting = True
         if self.selection_box:
             self.canvas.delete(self.selection_box)
-        self.selection_box = self.canvas.create_rectangle(event.x, event.y, event.x, event.y,
-                                                          outline="green", width=2)
+        self.selection_box = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline="yellow", width=2)
 
-    def drag_text_area(self, event):
-        if self.selecting_text and self.selection_box:
+    def on_mouse_drag(self, event):
+        if self.selecting and self.selection_box:
             self.canvas.coords(self.selection_box, self.start_x, self.start_y, event.x, event.y)
 
-    def ocr_text_area(self, event):
-        self.selecting_text = False
-        x1, y1 = int(min(self.start_x, event.x)), int(min(self.start_y, event.y))
-        x2, y2 = int(max(self.start_x, event.x)), int(max(self.start_y, event.y))
-        crop = self.display_crop[y1:y2, x1:x2]
-        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-        text = pytesseract.image_to_string(gray, config="--psm 6").strip()
-
-        if text and self.current_symbol:
-            self.text_links.append({
-                "text": text,
-                "symbol": self.current_symbol,
-                "rel_x": x1,
-                "rel_y": y1,
-                "w": x2 - x1,
-                "h": y2 - y1
-            })
-            self.current_symbol = None
-            self.render_image()
-
+    def on_mouse_up(self, event):
+        self.selecting = False
         if self.selection_box:
             self.canvas.delete(self.selection_box)
             self.selection_box = None
 
+        x1 = int((min(self.start_x, event.x) - self.image_x_offset) * self.image_scale)
+        y1 = int((min(self.start_y, event.y) - self.image_y_offset) * self.image_scale)
+        x2 = int((max(self.start_x, event.x) - self.image_x_offset) * self.image_scale)
+        y2 = int((max(self.start_y, event.y) - self.image_y_offset) * self.image_scale)
+
+        region = self.legend_crop[y1:y2, x1:x2]
+        if region.size == 0:
+            return
+
+        if self.detection_mode == "symbol":
+            _, symbols = detect_symbols(region)
+            if not symbols:
+                return
+            min_x = min([s["X"] for s in symbols])
+            min_y = min([s["Y"] for s in symbols])
+            max_x = max([s["X"] + s["Width"] for s in symbols])
+            max_y = max([s["Y"] + s["Height"] for s in symbols])
+
+            symbol = {
+                "rel_x": x1 + min_x,
+                "rel_y": y1 + min_y,
+                "w": max_x - min_x,
+                "h": max_y - min_y
+            }
+            self.current_symbol = symbol
+
+            sx1 = symbol["rel_x"] / self.image_scale + self.image_x_offset
+            sy1 = symbol["rel_y"] / self.image_scale + self.image_y_offset
+            sx2 = (symbol["rel_x"] + symbol["w"]) / self.image_scale + self.image_x_offset
+            sy2 = (symbol["rel_y"] + symbol["h"]) / self.image_scale + self.image_y_offset
+            rect = self.canvas.create_rectangle(sx1, sy1, sx2, sy2, outline="lime", width=2)
+            self.visual_elements.append([rect])
+            self.detection_mode = "text"
+
+        elif self.detection_mode == "text" and self.current_symbol:
+            texts = detect_text(region)
+            if not texts:
+                logging.warning("No text detected in the selected region")
+                self.current_symbol = None
+                return
+
+            min_x = min([t["bounding_box"][0] for t in texts])
+            min_y = min([t["bounding_box"][1] for t in texts])
+            max_x = max([t["bounding_box"][2] for t in texts])
+            max_y = max([t["bounding_box"][3] for t in texts])
+
+            combined_text = " ".join(t["text"] for t in texts)
+
+            text = {
+                "text": combined_text,
+                "rel_x": x1 + min_x,
+                "rel_y": y1 + min_y,
+                "w": max_x - min_x,
+                "h": max_y - min_y
+            }
+
+            self.links.append({"symbol": self.current_symbol, "text": text})
+            self.link_table.insert(tk.END, f"🔗 {text['text']}")
+            self.draw_link({"symbol": self.current_symbol, "text": text})
+
+            icon_crop = self.legend_crop[
+                self.current_symbol["rel_y"]:self.current_symbol["rel_y"]+self.current_symbol["h"],
+                self.current_symbol["rel_x"]:self.current_symbol["rel_x"]+self.current_symbol["w"]
+            ]
+            icon_dir = state.config.get("paths", {}).get("icon_dir", "symbol_icons")
+            os.makedirs(icon_dir, exist_ok=True)
+            safe_name = text["text"].strip().replace(" ", "_").replace("/", "-")
+            icon_path = os.path.join(icon_dir, f"{safe_name}.png")
+            cv2.imwrite(icon_path, icon_crop)
+
+            self.detection_mode = "symbol"
+            self.current_symbol = None
+
     def clear_last(self):
-        if self.text_links:
-            self.text_links.pop()
-        elif self.symbols:
-            self.symbols.pop()
-        self.render_image()
+        if self.links and self.visual_elements:
+            self.links.pop()
+            elements = self.visual_elements.pop()
+            for item in elements:
+                self.canvas.delete(item)
+            self.link_table.delete(tk.END)
+            self.detection_mode = "symbol"
 
     def clear_all(self):
-        self.symbols.clear()
-        self.text_links.clear()
+        self.links.clear()
+        self.visual_elements.clear()
+        self.link_table.delete(0, tk.END)
         self.render_image()
+        self.detection_mode = "symbol"
 
     def save_and_continue(self):
-        os.makedirs("symbol_links", exist_ok=True)
-        with open("symbol_links/links.json", "w") as f:
-            json.dump(self.text_links, f, indent=2)
-        if self.on_done:
-            self.on_done()
+        output_dir = state.config.get("paths", {}).get("output_dir", "symbol_links")
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, "links.json")
+        try:
+            with open(output_path, "w") as f:
+                json.dump(self.links, f, indent=2)
+            state.linked_items = self.links
+            logging.info(f"Saved symbol-text links to {output_path}")
+            if self.on_done:
+                self.on_done()
+            self.root.quit()
+        except Exception as e:
+            logging.error(f"Failed to save symbol links: {e}")
+
+    def zoom_in(self, event=None):
+        self.zoom_factor *= 1.1
+        self.render_image()
+
+    def zoom_out(self, event=None):
+        self.zoom_factor /= 1.1
+        self.render_image()
+
+    def set_mode(self, mode):
+        self.detection_mode = mode
+        logging.info(f"Detection mode set to: {mode}")
